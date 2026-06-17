@@ -423,7 +423,10 @@ const port = process.env.PORT || 8080;
 const httpServer = app.listen(port, () => {
   console.log(`Server listening on port ${port}`);
 });
-wss.on('connection', () => console.log('WS connection event'));
+
+const wss = new WebSocket.Server({ server: httpServer });
+  // дальше ваш код connection
+});
 const wss = new WebSocket.Server({ server: httpServer });
 
 const players = new Map(); // ws -> Player
