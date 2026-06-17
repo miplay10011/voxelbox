@@ -1,0 +1,13 @@
+[build]
+buildCommand = "npm install"
+startCommand = "npm start"
+
+[build.nixpacks]
+plan = "nodejs"
+nodeVersion = "20"
+
+[deploy]
+restartPolicyType = "always"
+
+[service]
+port = 8080

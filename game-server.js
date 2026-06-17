@@ -425,8 +425,6 @@ const httpServer = app.listen(port, () => {
 });
 
 const wss = new WebSocket.Server({ server: httpServer });
-  // дальше ваш код connection
-});
 const wss = new WebSocket.Server({ server: httpServer });
 
 const players = new Map(); // ws -> Player
