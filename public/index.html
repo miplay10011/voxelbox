@@ -33,7 +33,7 @@
 
   <script type="module">
     import * as THREE from 'three';
-    import msgpack from 'msgpack-lite';
+    import { encode, decode } from 'msgpack-lite';
 
     // ---------- ГЛОБАЛЬНАЯ ПАЛИТРА ----------
     const BLOCK = { AIR:0, DIRT:1, GRASS:2, STONE:3, WOOD:4, LEAVES:5, SAND:6, PLANKS:7 };
@@ -475,10 +475,10 @@
           let data = new Uint8Array(e.data);
           try {
             const decompressed = lz4.decode(data);
-            const obj = msgpack.decode(decompressed);
+            const obj = decode(decompressed);
             this.handle(obj);
-          } catch (e) {
-            const obj = msgpack.decode(data);
+          } catch (err) {
+            const obj = decode(data);
             this.handle(obj);
           }
         };
@@ -487,7 +487,7 @@
 
       send(obj) {
         if (this.ws.readyState !== WebSocket.OPEN) return;
-        const packed = msgpack.encode(obj);
+        const packed = encode(obj);
         const compressed = lz4.encode(packed);
         this.ws.send(compressed);
       }
@@ -502,7 +502,29 @@
           const chunk = window.game.world.chunks.get(key);
           if (chunk) {
             chunk.setBlock(x, y, z, blockId);
-            window.game.world.rebuildChunk(key);
+
+            const world = window.game.world;
+
+            if (chunk.mesh) {
+              world.scene.remove(chunk.mesh);
+              world.meshes = world.meshes.filter(m => m !== chunk.mesh);
+            }
+            if (chunk.transparentMesh) {
+              world.scene.remove(chunk.transparentMesh);
+              world.meshes = world.meshes.filter(m => m !== chunk.transparentMesh);
+            }
+
+            const result = chunk.buildMesh(world.playerPos);
+            if (result.mesh) {
+              world.scene.add(result.mesh);
+              world.meshes.push(result.mesh);
+              chunk.mesh = result.mesh;
+            }
+            if (result.transparent) {
+              world.scene.add(result.transparent);
+              world.meshes.push(result.transparent);
+              chunk.transparentMesh = result.transparent;
+            }
           }
         } else if (data.type === 'enemies') {
           window.game.world.updateEnemies(data.data);
