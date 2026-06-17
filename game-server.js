@@ -422,7 +422,6 @@ const port = process.env.PORT || 8080;
 const httpServer = app.listen(port, () => {
   console.log(`Server listening on port ${port}`);
 });
-app.get('/healthz', (req, res) => res.send('ok'));
 
 const wss = new WebSocket.Server({ server: httpServer });
 
@@ -432,31 +431,7 @@ wss.on('listening', () => {
 
 wss.on('connection', (ws) => {
   console.log('WS connection event');
-  ws.send('hello'); // пусть даже текст — просто факт соединения
-});
-console.log('Creating WebSocket server...');
-const wss = new WebSocket.Server({ server: httpServer });
-console.log('WebSocket server created');
 
-const players = new Map(); // ws -> Player
-const enemyManager = new EnemyManager();
-
-// Обновление врагов и рассылка
-setInterval(() => {
-  const playerList = Array.from(players.values());
-  enemyManager.update(0.1, playerList);
-  const enemyData = enemyManager.getEnemyData();
-  const payload = msgpack.encode({ type: 'enemies', data: enemyData });
-  const compressed = lz4.encode(payload);
-  for (const [ws, player] of players) {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(compressed, { binary: true });
-    }
-  }
-}, 100);
-
-wss.on('connection', (ws) => {
-    console.log('WS connection event');
   const playerId = Date.now() + '_' + Math.random().toString(36);
   const player = new Player(ws, playerId);
   players.set(ws, player);
@@ -469,7 +444,7 @@ wss.on('connection', (ws) => {
         try {
           const decompressed = lz4.decode(msg);
           data = msgpack.decode(decompressed);
-        } catch (e) {
+        } catch {
           data = msgpack.decode(msg);
         }
       } else {
@@ -495,8 +470,10 @@ wss.on('connection', (ws) => {
           player.z = pos.z;
           if (data.yaw !== undefined) player.yaw = data.yaw;
           if (data.pitch !== undefined) player.pitch = data.pitch;
-          // Обновляем БД асинхронно
-          const stmt = db.prepare('REPLACE INTO players (id, x, y, z, yaw, pitch) VALUES (?, ?, ?, ?, ?, ?)');
+
+          const stmt = db.prepare(
+            'REPLACE INTO players (id, x, y, z, yaw, pitch) VALUES (?, ?, ?, ?, ?, ?)'
+          );
           stmt.run(player.id, player.x, player.y, player.z, player.yaw, player.pitch);
           break;
         }
@@ -511,6 +488,24 @@ wss.on('connection', (ws) => {
     console.log(`Player ${playerId} disconnected`);
   });
 });
+
+const players = new Map(); // ws -> Player
+const enemyManager = new EnemyManager();
+
+// Обновление врагов и рассылка
+setInterval(() => {
+  const playerList = Array.from(players.values());
+  enemyManager.update(0.1, playerList);
+  const enemyData = enemyManager.getEnemyData();
+  const payload = msgpack.encode({ type: 'enemies', data: enemyData });
+  const compressed = lz4.encode(payload);
+  for (const [ws, player] of players) {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(compressed, { binary: true });
+    }
+  }
+}, 100);
+
 
 // ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------
 
