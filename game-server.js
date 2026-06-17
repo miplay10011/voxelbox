@@ -360,8 +360,9 @@ class EnemyManager {
 // ---------- ПУЛ ВОРКЕРОВ ДЛЯ ГЕНЕРАЦИИ ----------
 const workerPool = [];
 const MAX_WORKERS = 4;
+const workerPath = path.join(__dirname, 'worker.js');
 for (let i = 0; i < MAX_WORKERS; i++) {
-  const worker = new Worker('./worker.js');
+  const worker = new Worker(workerPath);
   workerPool.push(worker);
 }
 function getWorker() {
