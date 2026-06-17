@@ -1,0 +1,666 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Voxel Game – 100+ players</title>
+  <style>
+    body { margin: 0; overflow: hidden; font-family: sans-serif; background: #000; }
+    #info {
+      position: absolute; top: 10px; left: 10px; color: #fff;
+      background: rgba(0,0,0,0.7); padding: 8px 14px; border-radius: 6px;
+      pointer-events: none; user-select: none; z-index: 10;
+      font-size: 14px;
+    }
+    #fps {
+      position: absolute; bottom: 10px; left: 10px; color: #0f0;
+      background: rgba(0,0,0,0.5); padding: 4px 8px; border-radius: 4px;
+      font-family: monospace; z-index: 10;
+    }
+  </style>
+</head>
+<body>
+  <div id="info">Click to lock · WASD move · Space jump · Left: remove · Right: place</div>
+  <div id="fps">FPS: 0</div>
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+        "msgpack-lite": "https://cdn.jsdelivr.net/npm/msgpack-lite@0.1.26/dist/msgpack.min.js"
+      }
+    }
+  </script>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import msgpack from 'msgpack-lite';
+
+    // ---------- ГЛОБАЛЬНАЯ ПАЛИТРА ----------
+    const BLOCK = { AIR:0, DIRT:1, GRASS:2, STONE:3, WOOD:4, LEAVES:5, SAND:6, PLANKS:7 };
+    const BLOCK_COLORS = {
+      0: null,
+      1: 0x8B6914,
+      2: 0x7CB342,
+      3: 0x8C8C8C,
+      4: 0x8D6E63,
+      5: 0x4CAF50,
+      6: 0xF5E6CA,
+      7: 0xDEB887,
+    };
+    const TRANSPARENT = new Set([BLOCK.LEAVES]);
+
+    class BlockRegistry {
+      constructor() {
+        this.idToIndex = new Map();
+        this.indexToId = [];
+        const blocks = [
+          { id: 0, name: 'AIR' },
+          { id: 1, name: 'DIRT' },
+          { id: 2, name: 'GRASS' },
+          { id: 3, name: 'STONE' },
+          { id: 4, name: 'WOOD' },
+          { id: 5, name: 'LEAVES' },
+          { id: 6, name: 'SAND' },
+          { id: 7, name: 'PLANKS' },
+        ];
+        for (const b of blocks) {
+          this.idToIndex.set(b.id, this.indexToId.length);
+          this.indexToId.push(b.id);
+        }
+      }
+      getIndex(id) { return this.idToIndex.get(id) ?? 0; }
+      getId(index) { return this.indexToId[index] ?? 0; }
+    }
+    const blockRegistry = new BlockRegistry();
+
+    // ---------- КЭШ (IndexedDB) ----------
+    class ChunkCache {
+      constructor() {
+        this.db = null;
+        this.open();
+      }
+      open() {
+        const request = indexedDB.open('VoxelCache', 1);
+        request.onupgradeneeded = (e) => {
+          const db = e.target.result;
+          if (!db.objectStoreNames.contains('chunks')) {
+            db.createObjectStore('chunks', { keyPath: 'key' });
+          }
+        };
+        request.onsuccess = (e) => { this.db = e.target.result; };
+        request.onerror = () => console.warn('IndexedDB error');
+      }
+      async get(key) {
+        if (!this.db) return null;
+        return new Promise((resolve) => {
+          const tx = this.db.transaction('chunks', 'readonly');
+          const store = tx.objectStore('chunks');
+          const req = store.get(key);
+          req.onsuccess = () => resolve(req.result?.data || null);
+          req.onerror = () => resolve(null);
+        });
+      }
+      async set(key, data) {
+        if (!this.db) return;
+        const tx = this.db.transaction('chunks', 'readwrite');
+        const store = tx.objectStore('chunks');
+        store.put({ key, data });
+      }
+    }
+
+    // ---------- СЕКЦИЯ (клиент) ----------
+    class Section {
+      static SIZE = 16;
+      constructor(data = null) {
+        if (data && data.type === 'uniform') {
+          this.blocks = new Uint8Array(Section.SIZE ** 3);
+          this.blocks.fill(data.value);
+        } else if (data && data.type === 'rle') {
+          this.blocks = new Uint8Array(Section.SIZE ** 3);
+          let idx = 0;
+          for (let i = 0; i < data.data.length; i += 2) {
+            const val = data.data[i], count = data.data[i+1];
+            for (let j = 0; j < count; j++) this.blocks[idx++] = val;
+          }
+        } else {
+          this.blocks = new Uint8Array(Section.SIZE ** 3);
+        }
+        this.dirty = false;
+      }
+      getBlockIndex(x, y, z) {
+        return this.blocks[(y * Section.SIZE + z) * Section.SIZE + x];
+      }
+      setBlockIndex(x, y, z, idx) {
+        this.blocks[(y * Section.SIZE + z) * Section.SIZE + x] = idx;
+        this.dirty = true;
+      }
+    }
+
+    // ---------- ЧАНК (клиент) ----------
+    class Chunk {
+      static SIZE = 16;
+      static HEIGHT = 64;
+      static SECTIONS = 4;
+
+      constructor(cx, cz, sectionsData = null) {
+        this.cx = cx;
+        this.cz = cz;
+        this.sections = new Array(Chunk.SECTIONS).fill(null);
+        if (sectionsData) {
+          for (const secData of sectionsData) {
+            const sec = new Section(secData.data);
+            this.sections[secData.index] = sec;
+          }
+        }
+        this.mesh = null;
+        this.transparentMesh = null;
+        this.needsRebuild = true;
+        this.lodLevel = 0;
+      }
+
+      getBlock(x, y, z) {
+        const si = Math.floor(y / Section.SIZE);
+        const sec = this.sections[si];
+        if (!sec) return BLOCK.AIR;
+        const ly = y - si * Section.SIZE;
+        const idx = sec.getBlockIndex(x, ly, z);
+        return blockRegistry.getId(idx);
+      }
+
+      setBlock(x, y, z, id) {
+        const idx = blockRegistry.getIndex(id);
+        const si = Math.floor(y / Section.SIZE);
+        let sec = this.sections[si];
+        if (!sec) {
+          sec = new Section();
+          this.sections[si] = sec;
+        }
+        const ly = y - si * Section.SIZE;
+        sec.setBlockIndex(x, ly, z, idx);
+        this.needsRebuild = true;
+      }
+
+      buildMesh(cameraPos = null) {
+        if (!this.needsRebuild && this.mesh) {
+          return { mesh: this.mesh, transparent: this.transparentMesh };
+        }
+        this.needsRebuild = false;
+
+        const { SIZE, HEIGHT } = Chunk;
+        const getBlock = (x, y, z) => {
+          if (x < 0 || x >= SIZE || z < 0 || z >= SIZE || y < 0 || y >= HEIGHT) return BLOCK.AIR;
+          return this.getBlock(x, y, z);
+        };
+
+        let lodFactor = 1;
+        if (cameraPos) {
+          const dx = this.cx * SIZE + SIZE/2 - cameraPos.x;
+          const dz = this.cz * SIZE + SIZE/2 - cameraPos.z;
+          const dist = Math.sqrt(dx*dx + dz*dz);
+          if (dist > 40) lodFactor = 2;
+          if (dist > 80) lodFactor = 4;
+        }
+
+        const meshes = {
+          opaque: { vertices: [], normals: [], colors: [], indices: [] },
+          transparent: { vertices: [], normals: [], colors: [], indices: [] }
+        };
+
+        const addQuad = (target, x, y, z, nx, ny, nz, color) => {
+          let ux, uy, uz, vx, vy, vz;
+          if (nx !== 0) { ux = 0; uy = 1; uz = 0; vx = 0; vy = 0; vz = 1; }
+          else if (ny !== 0) { ux = 1; uy = 0; uz = 0; vx = 0; vy = 0; vz = 1; }
+          else { ux = 1; uy = 0; uz = 0; vx = 0; vy = 1; vz = 0; }
+          const h = 0.5;
+          const cx2 = x + 0.5, cy2 = y + 0.5, cz2 = z + 0.5;
+          const px = cx2 + nx * h, py = cy2 + ny * h, pz = cz2 + nz * h;
+          const corners = [[-1,-1],[1,-1],[1,1],[-1,1]];
+          const verts = corners.map(([su, sv]) => [
+            px + ux*su*h + vx*sv*h,
+            py + uy*su*h + vy*sv*h,
+            pz + uz*su*h + vz*sv*h
+          ]);
+          const baseIdx = target.vertices.length / 3;
+          const c = new THREE.Color(color);
+          for (const v of verts) {
+            target.vertices.push(v[0], v[1], v[2]);
+            target.normals.push(nx, ny, nz);
+            target.colors.push(c.r, c.g, c.b);
+          }
+          target.indices.push(baseIdx, baseIdx+1, baseIdx+2, baseIdx, baseIdx+2, baseIdx+3);
+        };
+
+        const step = lodFactor;
+        for (let x = 0; x < SIZE; x += step) {
+          for (let y = 0; y < HEIGHT; y += step) {
+            for (let z = 0; z < SIZE; z += step) {
+              const block = getBlock(x, y, z);
+              if (block === BLOCK.AIR) continue;
+              const isTransparent = TRANSPARENT.has(block);
+              const target = isTransparent ? meshes.transparent : meshes.opaque;
+              const color = BLOCK_COLORS[block] || 0xCCCCCC;
+              const dirs = [
+                { dx: step, dy: 0, dz: 0, nx: 1, ny: 0, nz: 0 },
+                { dx: -step, dy: 0, dz: 0, nx: -1, ny: 0, nz: 0 },
+                { dx: 0, dy: step, dz: 0, nx: 0, ny: 1, nz: 0 },
+                { dx: 0, dy: -step, dz: 0, nx: 0, ny: -1, nz: 0 },
+                { dx: 0, dy: 0, dz: step, nx: 0, ny: 0, nz: 1 },
+                { dx: 0, dy: 0, dz: -step, nx: 0, ny: 0, nz: -1 },
+              ];
+              for (const d of dirs) {
+                const nb = getBlock(x + d.dx, y + d.dy, z + d.dz);
+                if (nb === BLOCK.AIR) {
+                  addQuad(target, x, y, z, d.nx, d.ny, d.nz, color);
+                }
+              }
+            }
+          }
+        }
+
+        const createMesh = (data) => {
+          if (data.vertices.length === 0) return null;
+          const geom = new THREE.BufferGeometry();
+          geom.setAttribute('position', new THREE.Float32BufferAttribute(data.vertices, 3));
+          geom.setAttribute('normal', new THREE.Float32BufferAttribute(data.normals, 3));
+          geom.setAttribute('color', new THREE.Float32BufferAttribute(data.colors, 3));
+          geom.setIndex(data.indices);
+          geom.computeVertexNormals();
+          const mat = new THREE.MeshLambertMaterial({
+            vertexColors: true,
+            transparent: data === meshes.transparent,
+            opacity: 0.9,
+            side: THREE.DoubleSide,
+          });
+          const mesh = new THREE.Mesh(geom, mat);
+          mesh.position.set(this.cx * Chunk.SIZE, 0, this.cz * Chunk.SIZE);
+          mesh.castShadow = true;
+          mesh.receiveShadow = true;
+          mesh.frustumCulled = true;
+          return mesh;
+        };
+
+        if (this.mesh) { this.mesh.geometry.dispose(); this.mesh.material.dispose(); }
+        if (this.transparentMesh) { this.transparentMesh.geometry.dispose(); this.transparentMesh.material.dispose(); }
+        this.mesh = createMesh(meshes.opaque);
+        this.transparentMesh = createMesh(meshes.transparent);
+        return { mesh: this.mesh, transparent: this.transparentMesh };
+      }
+
+      getKey() { return `${this.cx},${this.cz}`; }
+    }
+
+    // ---------- МИР (клиент) ----------
+    class World {
+      constructor(scene) {
+        this.scene = scene;
+        this.chunks = new Map();
+        this.loadedKeys = new Set();
+        this.viewDist = 8;
+        this.cache = new ChunkCache();
+        this.playerPos = new THREE.Vector3();
+        this.subscribedRegions = new Set();
+        this.meshes = [];
+        this.enemyMeshes = [];
+      }
+
+      async loadChunk(cx, cz) {
+        const key = `${cx},${cz}`;
+        if (this.loadedKeys.has(key)) return;
+        const cached = await this.cache.get(key);
+        if (cached) {
+          this.addChunk(cx, cz, cached);
+          return;
+        }
+        if (!this.chunks.has(key)) {
+          const chunk = new Chunk(cx, cz);
+          this.chunks.set(key, chunk);
+        }
+      }
+
+      addChunk(cx, cz, sectionsData) {
+        const key = `${cx},${cz}`;
+        const chunk = new Chunk(cx, cz, sectionsData);
+        this.chunks.set(key, chunk);
+        this.loadedKeys.add(key);
+        const result = chunk.buildMesh(this.playerPos);
+        if (result.mesh) { this.scene.add(result.mesh); this.meshes.push(result.mesh); }
+        if (result.transparent) { this.scene.add(result.transparent); this.meshes.push(result.transparent); }
+        this.cache.set(key, sectionsData);
+      }
+
+      updateView(playerPos, playerDir) {
+        this.playerPos.copy(playerPos);
+        const cx = Math.floor(playerPos.x / Chunk.SIZE);
+        const cz = Math.floor(playerPos.z / Chunk.SIZE);
+        const rx = Math.floor(cx / 64);
+        const rz = Math.floor(cz / 64);
+        for (let drx = -1; drx <= 1; drx++) {
+          for (let drz = -1; drz <= 1; drz++) {
+            const key = `${rx+drx},${rz+drz}`;
+            if (!this.subscribedRegions.has(key)) {
+              this.subscribedRegions.add(key);
+              window.network.send({ type: 'subscribe', rx: rx+drx, rz: rz+drz });
+            }
+          }
+        }
+        for (let dx = -this.viewDist; dx <= this.viewDist; dx++) {
+          for (let dz = -this.viewDist; dz <= this.viewDist; dz++) {
+            this.loadChunk(cx + dx, cz + dz);
+          }
+        }
+        // Выгрузка дальних
+        for (const key of this.loadedKeys) {
+          const [cx2, cz2] = key.split(',').map(Number);
+          const dx = cx2 - cx, dz = cz2 - cz;
+          if (dx*dx + dz*dz > (this.viewDist+2)*(this.viewDist+2)) {
+            const chunk = this.chunks.get(key);
+            if (chunk) {
+              if (chunk.mesh) { this.scene.remove(chunk.mesh); this.meshes = this.meshes.filter(m => m !== chunk.mesh); }
+              if (chunk.transparentMesh) { this.scene.remove(chunk.transparentMesh); this.meshes = this.meshes.filter(m => m !== chunk.transparentMesh); }
+              chunk.mesh = null;
+              chunk.transparentMesh = null;
+            }
+            this.loadedKeys.delete(key);
+          }
+        }
+      }
+
+      updateEnemies(enemyData) {
+        for (const mesh of this.enemyMeshes) {
+          this.scene.remove(mesh);
+          mesh.geometry.dispose();
+          mesh.material.dispose();
+        }
+        this.enemyMeshes = [];
+        const geometry = new THREE.SphereGeometry(0.4, 8, 8);
+        const material = new THREE.MeshLambertMaterial({ color: 0xff0000 });
+        for (const e of enemyData) {
+          const mesh = new THREE.Mesh(geometry, material);
+          mesh.position.set(e.x, e.y, e.z);
+          this.scene.add(mesh);
+          this.enemyMeshes.push(mesh);
+        }
+      }
+    }
+
+    // ---------- ИГРОК ----------
+    class Player {
+      constructor(camera) {
+        this.camera = camera;
+        this.velocity = new THREE.Vector3();
+        this.canJump = true;
+        this.yaw = 0;
+        this.pitch = 0;
+        this.moveState = { forward: false, backward: false, left: false, right: false, jump: false };
+        this.speed = 8;
+        this.gravity = -25;
+        this.jumpSpeed = 6;
+        this.height = 1.5;
+        this.setupControls();
+      }
+
+      setupControls() {
+        document.addEventListener('keydown', (e) => {
+          switch (e.code) {
+            case 'KeyW': this.moveState.forward = true; break;
+            case 'KeyS': this.moveState.backward = true; break;
+            case 'KeyA': this.moveState.left = true; break;
+            case 'KeyD': this.moveState.right = true; break;
+            case 'Space': this.moveState.jump = true; e.preventDefault(); break;
+          }
+        });
+        document.addEventListener('keyup', (e) => {
+          switch (e.code) {
+            case 'KeyW': this.moveState.forward = false; break;
+            case 'KeyS': this.moveState.backward = false; break;
+            case 'KeyA': this.moveState.left = false; break;
+            case 'KeyD': this.moveState.right = false; break;
+            case 'Space': this.moveState.jump = false; break;
+          }
+        });
+        document.addEventListener('mousemove', (e) => {
+          if (!document.pointerLockElement) return;
+          this.yaw -= e.movementX * 0.002;
+          this.pitch -= e.movementY * 0.002;
+          this.pitch = Math.max(-Math.PI/2 + 0.01, Math.min(Math.PI/2 - 0.01, this.pitch));
+          this.camera.rotation.order = 'YXZ';
+          this.camera.rotation.y = this.yaw;
+          this.camera.rotation.x = this.pitch;
+        });
+      }
+
+      update(delta) {
+        if (!document.pointerLockElement) return;
+        const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(this.camera.quaternion);
+        forward.y = 0; forward.normalize();
+        const right = new THREE.Vector3(1, 0, 0).applyQuaternion(this.camera.quaternion);
+        right.y = 0; right.normalize();
+
+        const moveVec = new THREE.Vector3();
+        if (this.moveState.forward) moveVec.add(forward);
+        if (this.moveState.backward) moveVec.sub(forward);
+        if (this.moveState.left) moveVec.sub(right);
+        if (this.moveState.right) moveVec.add(right);
+        moveVec.y = 0;
+        if (moveVec.lengthSq() > 0) moveVec.normalize().multiplyScalar(this.speed * delta);
+
+        this.velocity.y += this.gravity * delta;
+        if (this.moveState.jump && this.canJump) {
+          this.velocity.y = this.jumpSpeed;
+          this.canJump = false;
+        }
+        const newY = this.camera.position.y + this.velocity.y * delta;
+        if (newY <= this.height) {
+          this.camera.position.y = this.height;
+          this.velocity.y = 0;
+          this.canJump = true;
+        } else {
+          this.camera.position.y = newY;
+        }
+        this.camera.position.x += moveVec.x;
+        this.camera.position.z += moveVec.z;
+      }
+
+      getPosition() { return this.camera.position; }
+    }
+
+    // ---------- СЕТЬ ----------
+    class Network {
+      constructor() {
+        this.ws = new WebSocket(`ws://${window.location.host}`);
+        this.ws.binaryType = 'arraybuffer';
+        this.ws.onopen = () => console.log('Connected to server');
+        this.ws.onmessage = (e) => {
+          let data = new Uint8Array(e.data);
+          try {
+            const decompressed = lz4.decode(data);
+            const obj = msgpack.decode(decompressed);
+            this.handle(obj);
+          } catch (e) {
+            const obj = msgpack.decode(data);
+            this.handle(obj);
+          }
+        };
+        this.ws.onclose = () => setTimeout(() => location.reload(), 1000);
+      }
+
+      send(obj) {
+        if (this.ws.readyState !== WebSocket.OPEN) return;
+        const packed = msgpack.encode(obj);
+        const compressed = lz4.encode(packed);
+        this.ws.send(compressed);
+      }
+
+      handle(data) {
+        if (data.type === 'chunk') {
+          const [cx, cz] = data.key.split(',').map(Number);
+          window.game.world.addChunk(cx, cz, data.sections);
+        } else if (data.type === 'blockChange') {
+          const { cx, cz, x, y, z, blockId } = data;
+          const key = `${cx},${cz}`;
+          const chunk = window.game.world.chunks.get(key);
+          if (chunk) {
+            chunk.setBlock(x, y, z, blockId);
+            window.game.world.rebuildChunk(key);
+          }
+        } else if (data.type === 'enemies') {
+          window.game.world.updateEnemies(data.data);
+        }
+      }
+    }
+
+    // ---------- РЕНДЕРЕР ----------
+    class Renderer {
+      constructor() {
+        this.scene = new THREE.Scene();
+        this.scene.background = new THREE.Color(0x87CEEB);
+        this.camera = new THREE.PerspectiveCamera(70, window.innerWidth/window.innerHeight, 0.1, 200);
+        this.camera.position.set(8, 30, 8);
+        this.renderer = new THREE.WebGLRenderer({ antialias: true });
+        this.renderer.setSize(window.innerWidth, window.innerHeight);
+        this.renderer.shadowMap.enabled = true;
+        this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        document.body.appendChild(this.renderer.domElement);
+        this.setupLights();
+        this.setupResize();
+      }
+
+      setupLights() {
+        const ambient = new THREE.AmbientLight(0x404060);
+        this.scene.add(ambient);
+        const sun = new THREE.DirectionalLight(0xffeedd, 1.2);
+        sun.position.set(50, 80, 30);
+        sun.castShadow = true;
+        sun.shadow.mapSize.width = 1024;
+        sun.shadow.mapSize.height = 1024;
+        const d = 60;
+        sun.shadow.camera.left = -d;
+        sun.shadow.camera.right = d;
+        sun.shadow.camera.top = d;
+        sun.shadow.camera.bottom = -d;
+        sun.shadow.camera.near = 1;
+        sun.shadow.camera.far = 120;
+        this.scene.add(sun);
+      }
+
+      setupResize() {
+        window.addEventListener('resize', () => {
+          this.camera.aspect = window.innerWidth / window.innerHeight;
+          this.camera.updateProjectionMatrix();
+          this.renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+      }
+
+      render() {
+        this.renderer.render(this.scene, this.camera);
+      }
+    }
+
+    // ---------- ИГРА ----------
+    class Game {
+      constructor() {
+        this.renderer = new Renderer();
+        this.world = new World(this.renderer.scene);
+        this.player = new Player(this.renderer.camera);
+        window.network = new Network();
+        window.game = this;
+        this.setupInteraction();
+        this.clock = new THREE.Clock();
+        this.frameSkipCounter = 0;
+        this.lastSend = 0;
+        this.animate();
+      }
+
+      setupInteraction() {
+        document.addEventListener('click', () => {
+          if (!document.pointerLockElement) {
+            this.renderer.renderer.domElement.requestPointerLock();
+          }
+        });
+
+        const raycaster = new THREE.Raycaster();
+        const pointer = new THREE.Vector2();
+
+        const getHitBlock = () => {
+          pointer.set(0, 0);
+          raycaster.setFromCamera(pointer, this.renderer.camera);
+          const meshes = this.world.meshes;
+          const intersects = raycaster.intersectObjects(meshes);
+          if (intersects.length > 0) {
+            const intersect = intersects[0];
+            const point = intersect.point;
+            const normal = intersect.face.normal.clone();
+            const idx = Math.floor(point.x - normal.x * 0.5);
+            const idy = Math.floor(point.y - normal.y * 0.5);
+            const idz = Math.floor(point.z - normal.z * 0.5);
+            const cx = Math.floor(idx / Chunk.SIZE);
+            const cz = Math.floor(idz / Chunk.SIZE);
+            const lx = idx - cx * Chunk.SIZE;
+            const ly = idy;
+            const lz = idz - cz * Chunk.SIZE;
+            return { cx, cz, x: lx, y: ly, z: lz, normal };
+          }
+          return null;
+        };
+
+        document.addEventListener('mousedown', (e) => {
+          if (!document.pointerLockElement) return;
+          const hit = getHitBlock();
+          if (!hit) return;
+          if (e.button === 0) {
+            window.network.send({ type: 'blockChange', cx: hit.cx, cz: hit.cz, x: hit.x, y: hit.y, z: hit.z, blockId: BLOCK.AIR });
+          } else if (e.button === 2) {
+            const nx = hit.x + Math.round(hit.normal.x);
+            const ny = hit.y + Math.round(hit.normal.y);
+            const nz = hit.z + Math.round(hit.normal.z);
+            if (ny >= 0 && ny < Chunk.HEIGHT) {
+              window.network.send({ type: 'blockChange', cx: hit.cx, cz: hit.cz, x: nx, y: ny, z: nz, blockId: BLOCK.DIRT });
+            }
+          }
+        });
+        document.addEventListener('contextmenu', (e) => e.preventDefault());
+      }
+
+      animate() {
+        const delta = Math.min(this.clock.getDelta(), 0.05);
+        if (delta > 0.03) {
+          this.frameSkipCounter++;
+          if (this.frameSkipCounter % 2 === 0) {
+            requestAnimationFrame(() => this.animate());
+            return;
+          }
+        } else {
+          this.frameSkipCounter = 0;
+        }
+
+        const steps = 2;
+        const subDelta = delta / steps;
+        for (let i = 0; i < steps; i++) {
+          this.player.update(subDelta);
+        }
+
+        const pos = this.player.getPosition();
+        const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(this.renderer.camera.quaternion);
+        this.world.updateView(pos, dir);
+
+        if (Date.now() - this.lastSend > 50) {
+          window.network.send({
+            type: 'position',
+            pos: { x: pos.x, y: pos.y, z: pos.z },
+            yaw: this.player.yaw,
+            pitch: this.player.pitch
+          });
+          this.lastSend = Date.now();
+        }
+
+        this.renderer.render();
+        requestAnimationFrame(() => this.animate());
+      }
+    }
+
+    // ---------- ЗАПУСК ----------
+    const game = new Game();
+    console.log('Voxel game started');
+  </script>
+</body>
+</html>
