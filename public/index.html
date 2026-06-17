@@ -472,12 +472,14 @@
         this.ws.binaryType = 'arraybuffer';
         this.ws.onopen = () => console.log('Connected to server');
         this.ws.onmessage = (e) => {
+          console.log('WS message:', e.data);
           let data = new Uint8Array(e.data);
           try {
             const decompressed = lz4.decode(data);
             const obj = decode(decompressed);
             this.handle(obj);
           } catch (err) {
+            console.log('catch error');
             const obj = decode(data);
             this.handle(obj);
           }

@@ -5,7 +5,6 @@ const lz4 = require('lz4');
 const Database = require('better-sqlite3');
 const { Worker } = require('worker_threads');
 const path = require('path');
-app.get('/healthz', (req, res) => res.send('ok'));
 // ---------- ПОДКЛЮЧЕНИЕ К БД (SQLite с WAL) ----------
 const db = new Database('./db/world.db', { wal: true });
 db.pragma('journal_mode = WAL');
@@ -423,7 +422,18 @@ const port = process.env.PORT || 8080;
 const httpServer = app.listen(port, () => {
   console.log(`Server listening on port ${port}`);
 });
+app.get('/healthz', (req, res) => res.send('ok'));
 
+const wss = new WebSocket.Server({ server: httpServer });
+
+wss.on('listening', () => {
+  console.log('WS server listening');
+});
+
+wss.on('connection', (ws) => {
+  console.log('WS connection event');
+  ws.send('hello'); // пусть даже текст — просто факт соединения
+});
 console.log('Creating WebSocket server...');
 const wss = new WebSocket.Server({ server: httpServer });
 console.log('WebSocket server created');
