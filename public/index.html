@@ -468,7 +468,7 @@
     class Network {
       constructor() {
         const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        this.ws = new WebSocket(`${proto}//${window.location.host}`);
+        this.ws = new WebSocket(`${proto}//${window.location.hostname}:${window.location.port || (window.location.protocol === 'https:' ? '443' : '80')}`);
         this.ws.binaryType = 'arraybuffer';
         this.ws.onopen = () => console.log('Connected to server');
         this.ws.onmessage = (e) => {

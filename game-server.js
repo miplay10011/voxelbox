@@ -442,6 +442,7 @@ setInterval(() => {
 }, 100);
 
 wss.on('connection', (ws) => {
+    console.log('WS connection event');
   const playerId = Date.now() + '_' + Math.random().toString(36);
   const player = new Player(ws, playerId);
   players.set(ws, player);
