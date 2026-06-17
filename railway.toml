@@ -1,13 +1,17 @@
+app = "magvox-voxelbox"
+primary_region = "sfo"
+
 [build]
-buildCommand = "npm install"
-startCommand = "npm start"
+command = "npm start"
+build_path = "."
+
+[deploy]
+restart_policy_type = "never"
 
 [build.nixpacks]
 plan = "nodejs"
 nodeVersion = "20"
 
-[deploy]
-restartPolicyType = "always"
-
-[service]
-port = 8080
+[http]
+service_port = 8080
+force_https = true
