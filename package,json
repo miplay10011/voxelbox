@@ -1,0 +1,17 @@
+{
+  "name": "voxel-game-optimized",
+  "version": "1.0.0",
+  "description": "Voxel game with 100+ players (single server, no Redis)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "ws": "^8.14.2",
+    "msgpack-lite": "^0.1.26",
+    "lz4": "^0.6.5",
+    "better-sqlite3": "^9.0.0",
+    "three": "^0.160.0"
+  }
+}
