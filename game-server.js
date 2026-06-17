@@ -419,9 +419,11 @@ async function delCache(key) {
 const app = express();
 app.use(express.static(path.join(__dirname, 'public')));
 
-const httpServer = app.listen(process.env.PORT || 3000, () => {
-  console.log(`Server listening on port ${process.env.PORT || 3000}`);
+const port = process.env.PORT || 8080;
+const httpServer = app.listen(port, () => {
+  console.log(`Server listening on port ${port}`);
 });
+wss.on('connection', () => console.log('WS connection event'));
 const wss = new WebSocket.Server({ server: httpServer });
 
 const players = new Map(); // ws -> Player
