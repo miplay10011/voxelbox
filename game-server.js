@@ -425,7 +425,6 @@ const httpServer = app.listen(port, () => {
 });
 
 const wss = new WebSocket.Server({ server: httpServer });
-const wss = new WebSocket.Server({ server: httpServer });
 
 const players = new Map(); // ws -> Player
 const enemyManager = new EnemyManager();
